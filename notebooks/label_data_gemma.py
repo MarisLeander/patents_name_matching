@@ -3,11 +3,14 @@ import io
 import time
 import json
 import vllm
+import torch
 import duckdb
 import contextlib
+import pandas as pd
+from tqdm import tqdm
 from pathlib import Path
 from vllm import LLM, SamplingParams
-import inference_helper as ih
+from duckdb import ConstraintException
 
 def get_hf_api_key() -> str:
     """Gets the user's Huggingface API key from a config file."""
@@ -22,29 +25,9 @@ def get_hf_api_key() -> str:
         return None
 
 def connect_db():
-    path = home_dir / "patents_name_matching" / "secrets.json" / "data" / "database" / "patent_database"
+    home_dir = Path.home()
+    path = home_dir / "patents_name_matching" / "data" / "database" / "patent_database"
     return duckdb.connect(database=path, read_only=False)
-
-def create_label_table(reset: bool = False):
-    """Creates a table in the database to store the labels
-
-    Args:
-        reset: Whether to reset the table if it already exists
-    Returns:
-        None
-    """
-    con = connect_db()
-    if reset:
-        con.execute("DROP TABLE IF EXISTS labels")
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS labels_gemma (
-            han_id INTEGER,
-            firm_id INTEGER REFERENCES firm_names(firm_id),
-            label INTEGER
-        )
-    """)
-    con.close()
 
 def insert_label(han_id: int, firm_id: int, label: int):
     """Inserts a label into the label table
@@ -56,6 +39,7 @@ def insert_label(han_id: int, firm_id: int, label: int):
     Returns:
         None
     """
+    con = connect_db()
     try:
         con.execute(f"""
             INSERT INTO labels_gemma
@@ -64,16 +48,56 @@ def insert_label(han_id: int, firm_id: int, label: int):
     except ConstraintException as e:
         # Entry already in Database
         pass
+    con.close()
+
+def create_label_table(reset: bool = False):
+    """Creates a table in the database to store the labels
+
+    Args:
+        reset: Whether to reset the table if it already exists
+    Returns:
+        None
+    """
+    con = connect_db()
+    if reset:
+        con.execute("DROP TABLE IF EXISTS labels_gemma")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS labels_gemma (
+            han_id INTEGER,
+            firm_id INTEGER REFERENCES firm_names(firm_id),
+            label BOOLEAN,
+            PRIMARY KEY (han_id, firm_id)
+        )
+    """)
+    con.close()
 
     
 def get_prompt_batch():
     con = connect_db()
     sql = """
-    SELECT DISTINCT firm_id, han_id, similarity, name, han_name, person_name, psn_name FROM patstat_firm_match
-    JOIN firm_names USING(firm_id)
-    JOIN patstat_data USING(han_id)
-    WHERE similarity >= 0.9
-    LIMIT 1
+    SELECT DISTINCT
+        pfm.firm_id,
+        pfm.han_id,
+        pfm.similarity,
+        fn.name,
+        pd.han_name,
+        pd.person_name,
+        pd.psn_name
+    FROM
+        patstat_firm_match AS pfm
+    JOIN
+        firm_names AS fn USING(firm_id)
+    JOIN
+        patstat_data AS pd USING(han_id)
+    WHERE
+        pfm.similarity >= 0.9
+    AND NOT EXISTS (
+        SELECT 1
+        FROM labels_gemma AS lg
+        WHERE lg.firm_id = pfm.firm_id AND lg.han_id = pfm.han_id
+    )
+    LIMIT 200000;
     """
     data = con.execute(sql).fetchdf()
     
@@ -100,7 +124,7 @@ def get_prompt_batch():
         # If the name jaro-winkler similarity is >= .99, we assume it is a match
         if row['similarity'] >= 0.99:
             # We assume it is a match
-            insert_label(han_id, firm_id, 1)
+            insert_label(han_id, firm_id, True)
         else:
             # 1. Convert the row to JSON to be used as input
             input_data_json = row.to_json()
@@ -157,38 +181,50 @@ def gemma_batch_inference(
 
     # Process the results and insert into the database
     print("Processing results and inserting into database...")
-    records_to_insert = []
-    # We zip the original prompt_batch with the outputs to maintain metadata
-    for prompt_dict, output in zip(prompt_batch, outputs):
-        print(prompt_dict, output)
-    #     paragraph_id = prompt_dict.get("paragraph_id")
-    #     prompt_type = prompt_dict.get("prompt_type")
-    #     generated_text = output.outputs[0].text.strip()
-
-    #     # If technique is chain-of-thought we need to parse our prediction and insert the CoT as thinking_process
-    #     if technique == "CoT":
-    #         records_to_insert.append({
-    #             "id": paragraph_id, 
-    #             "model": 'gemma-3-27b-it', 
-    #             "prompt_type": prompt_type, 
-    #             "technique": technique, 
-    #             "prediction": ih.extract_stance_cot(generated_text), 
-    #             "thinking_process": generated_text,
-    #             "thoughts": None # Placeholder
-    #         })
-    #     else:
-    #         records_to_insert.append({
-    #             "id": paragraph_id, 
-    #             "model": 'gemma-3-27b-it', 
-    #             "prompt_type": prompt_type, 
-    #             "technique": technique, 
-    #             "prediction": generated_text, 
-    #             "thinking_process": None, # Placeholder
-    #             "thoughts": None # Placeholder
-    #         })
+    
+    data_to_insert = []
+    for prompt_dict, output in tqdm(
+        zip(prompt_batch, outputs),
+        total=len(prompt_batch),
+        desc="Processing model outputs"
+    ):
+        # Get model answer and IDs
+        generated_answer = output.outputs[0].text.strip()
+        boolean_answer = generated_answer.lower() == 'true'
+        han_id = prompt_dict.get("han_id")
+        firm_id = prompt_dict.get("firm_id")
+        
+        # Append a dictionary or tuple to our list
+        data_to_insert.append({
+            "han_id": han_id,
+            "firm_id": firm_id,
+            "label": int(boolean_answer)
+        })
+    
+    if data_to_insert:
+        # --- Step 1: Create the DataFrame ---
+        insert_df = pd.DataFrame(data_to_insert)
+    
+        con = connect_db()
+        try:
+            # Register the DataFrame as a temporary table ---
+            con.register('new_labels', insert_df)
+    
+            # Execute the INSERT with ON CONFLICT ---
+            # This SQL query selects all data from our temporary table and inserts it,
+            # ignoring any rows that violate the primary key constraint.
+            con.execute("""
+                INSERT INTO labels_gemma
+                SELECT * FROM new_labels
+                ON CONFLICT (han_id, firm_id) DO NOTHING
+            """)
             
-    # print("Inserting predictions into db")
-    # ih.insert_batch(records_to_insert, engineering)  
+            print(f"Processed {len(insert_df)} records (new records inserted, duplicates ignored).")
+    
+        except Exception as e:
+            print(f"An error occurred during bulk insert: {e}")
+        finally:
+            con.close()
 
         
 
@@ -212,9 +248,11 @@ def main():
     print(f"Initializing LLM '{model_name}' with vLLM...")
     print("This may take several minutes...")
     try:
+        num_gpus = torch.cuda.device_count()
+        print(f"Using {num_gpus} GPUs")
         llm = LLM(
             model=model_name,
-            tensor_parallel_size=1,  # Use 1 GPUs
+            tensor_parallel_size=num_gpus,  # Use all GPUs
             trust_remote_code=True
         )
     except Exception as e:
